@@ -62,6 +62,10 @@ and takes the choice as an argument. Section 3 reports absolute values
 alongside, with the fraction of posterior draws for which an absolute 95 %
 threshold is not attainable.
 
+ALD (Acute Lethal Dose or Death) is a definition that is interchangeable with
+AD (Acute Dose or Acute Death). It can be interpreted in two domains (T for
+temperature and D for distance).
+
 ## Data
 
 `data/` holds per-bin cell counts (number alive, number expected) with the
