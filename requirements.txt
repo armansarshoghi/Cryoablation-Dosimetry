@@ -1,9 +1,0 @@
-# Python 3.13.2
-numpy==2.2.3
-pandas==2.2.3
-scipy==1.15.2
-scikit-learn==1.7.0
-pymc==5.28.4
-arviz==0.23.4
-nutpie==0.16.8
-ipykernel==6.29.5
