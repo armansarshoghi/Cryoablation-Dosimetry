@@ -25,7 +25,10 @@ models relating minimum temperature to acute cell death.
                         Slower than the notebook; run separately.
     data/               Per-bin cell counts with their assigned minimum
                         temperatures, and the cohort ice-ball summary
-                        statistics.
+                        statistics. These are the model inputs.
+    figure_source_data/ The values plotted in each main-figure panel, one CSV
+                        per panel. These are outputs, derived from data/ and
+                        the thermocouple recordings by the notebook.
     Final - .../        Thermocouple recordings, one CSV per experiment, in the
                         directory layout the acquisition used.
 
@@ -71,6 +74,32 @@ mapping) require the individual patient measurements rather than the cohort
 summary statistics. Supp. Table S5 (numerical convergence of the grid, time
 step and domain radius) is a one-off study of the solver rather than an
 analysis of the data.
+
+## Figure source data
+
+`figure_source_data/` holds the plotted values behind each main-figure graph,
+one CSV per panel. File names carry the panel they belong to.
+
+| Panel | Files |
+|---|---|
+| Fig. 1c, 1d, 3c | `*_thermal_traces.csv`: time, measured mean and SEM, and the model curve for each thermocouple |
+| Fig. 1e, 1f, 3d | `*_parity.csv`: every measured and predicted pair. `*_parity_binned.csv`: the binned mean and SD markers |
+| Fig. 1g, 1h | `*_iceball_front_*.csv`: modelled front radius over time. `*_crossings.csv`: measured phase-change crossings, averaged per minute across replicates |
+| Fig. 2b, 2c, 2d | points with SEM. `*_fit.csv`: the posterior curve and its credible band |
+| Fig. 2e | survival after one and two freezes, with the counts behind each fraction |
+| Fig. 3e | hexagonal bin centres with mean minimum temperature and mean CC3, one file per construct |
+| Fig. 3f | apoptotic signal against minimum temperature, raw and smoothed |
+| Fig. 4a, 5a | the geometry and isodose tables |
+
+The parity and cascade files cover every in-medium thermocouple that the panels
+draw. The out-of-sample statistics quoted in the paper use only the channels
+that undergo phase change, which the notebook reports separately.
+
+Figure 4b is not included. It plots individual patient ice-ball measurements,
+which are held under a Data Use Agreement; the cohort summary statistics the
+panel also shows are in `data/cohort_geometry.csv`.
+
+Regenerate with `python export_figure_data.py` from the analysis repository.
 
 ## Dose metric definitions
 
