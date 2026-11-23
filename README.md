@@ -9,8 +9,9 @@ models relating minimum temperature to acute cell death.
 
 ## Contents
 
-    cryo_thermal.py     Finite-difference solver. Apparent heat capacity for
-                        phase change, implicit Euler, Thomas algorithm. Also
+    cryo_thermal.py     Finite-difference solver in conservative form. Apparent
+                        heat capacity for phase change, natural convection as a
+                        flux at the ice front, implicit Euler, Thomas algorithm. Also
                         holds the experiment registry and the per-experiment
                         boundary-offset fit.
     lung_chain.py       Lung tissue parameterisation and the chained

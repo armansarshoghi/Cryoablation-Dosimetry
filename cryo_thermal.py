@@ -25,6 +25,7 @@ Usage
 import numpy as np
 import pandas as pd
 from scipy.interpolate import interp1d
+from scipy.linalg import solve_banded
 from scipy.optimize import minimize_scalar
 from scipy.signal import savgol_filter
 import matplotlib
@@ -52,19 +53,10 @@ L_GELMA   = 284_000.0      # J/kg  (GelMA 3-D construct)
 # ==================================================================
 #  DOMAIN TRUNCATION
 # ==================================================================
-# How far the far-field Dirichlet boundary sits beyond the outermost radius
-# the solution is evaluated at.
-#
-# These are NOT numerically converged values: pushing the boundary out to 25 mm
-# moves the 0 degC isotherm of a 10-minute freeze by ~0.25 mm, and 25 mm and
-# 40 mm then agree. But the larger, converged domain fits the measured
-# thermocouples WORSE (clinical R2_val 0.78 -> 0.70), because a warm boundary
-# close to the ablation zone stands in for the non-radial heat inflow -- through
-# the dish, the medium reservoir and the air above -- that the 1-D model
-# neglects by construction. The truncation is therefore a modelling choice, not
-# an oversight, and it is kept at the submitted values so the reported numbers
-# remain those of the fitted model. The revision notebook (section 1) reports
-# the convergence study and the <=0.15 mm effect on every reported dimension.
+# Default position of the far-field Dirichlet boundary when no vessel wall is
+# given (3-D constructs, lung chain): this far beyond the outermost radius the
+# solution is evaluated at. The monolayer experiments set the boundary at the
+# vessel wall instead (r_wall in the registry).
 DOMAIN_MARGIN_MM = 3.0
 DOMAIN_MIN_MM    = 10.0
 
@@ -88,21 +80,11 @@ def _thomas(a, b, c, d):
     a: sub-diagonal (n-1), b: main diagonal (n),
     c: super-diagonal (n-1), d: RHS (n).
     """
-    n = len(b)
-    cp = np.empty(n - 1)
-    dp = np.empty(n)
-    cp[0] = c[0] / b[0]
-    dp[0] = d[0] / b[0]
-    for i in range(1, n):
-        w = b[i] - a[i - 1] * cp[i - 1]
-        if i < n - 1:
-            cp[i] = c[i] / w
-        dp[i] = (d[i] - a[i - 1] * dp[i - 1]) / w
-    x = np.empty(n)
-    x[-1] = dp[-1]
-    for i in range(n - 2, -1, -1):
-        x[i] = dp[i] - cp[i] * x[i + 1]
-    return x
+    ab = np.zeros((3, len(b)))
+    ab[0, 1:] = c
+    ab[1] = b
+    ab[2, :-1] = a
+    return solve_banded((1, 1), ab, d)
 
 
 def h_to_W(h_Wm2K, L_char_mm):
@@ -121,12 +103,45 @@ def h_to_W(h_Wm2K, L_char_mm):
     return h_Wm2K / (L_char_mm * 1e-3 * 1e9)
 
 
+# Water properties for the film temperature, 0-30 degC
+_T_TAB    = np.array([0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0])
+_BETA_TAB = np.array([-0.68, 0.16, 0.88, 1.51, 2.07, 2.57, 3.03]) * 1e-4   # 1/K
+_NU_TAB   = np.array([1.787, 1.519, 1.307, 1.139, 1.004, 0.893, 0.801]) * 1e-6  # m^2/s
+_K_TAB    = np.array([0.561, 0.571, 0.580, 0.589, 0.598, 0.607, 0.615])    # W/(m*K)
+H_LAYER_MM = 10.0   # depth of the liquid layer / height of the 3-D construct
+
+
+def h_natural_convection(T_i, T_phase, H_mm=H_LAYER_MM):
+    """Natural-convection coefficient at the ice surface, W/(mm^2*K).
+
+    Churchill & Chu (1975) laminar correlation for a vertical surface of
+    height H, water properties at the film temperature (T_i + T_phase)/2.
+    """
+    T_f = 0.5 * (T_i + T_phase)
+    beta = np.interp(T_f, _T_TAB, _BETA_TAB)
+    nu = np.interp(T_f, _T_TAB, _NU_TAB)
+    k = np.interp(T_f, _T_TAB, _K_TAB)
+    alpha = k / (1000.0 * 4190.0)
+    H = H_mm * 1e-3
+    Ra = 9.81 * abs(beta) * abs(T_i - T_phase) * H ** 3 / (nu * alpha)
+    Nu = 0.68 + 0.670 * Ra ** 0.25 / (1.0 + (0.492 * alpha / nu) ** (9.0 / 16.0)) ** (4.0 / 9.0)
+    return Nu * k / H * 1e-6
+
+
+def model_kwargs(exp, T_i):
+    """Solver settings for one experiment: convection, vessel wall, grid."""
+    return dict(h_front=h_natural_convection(T_i, exp['T_phase']),
+                r_max=exp.get('r_wall'),
+                dr=exp.get('dr', 0.05), n_sub=exp.get('n_sub', 4))
+
+
 def solve_fdm(t, T_bc, r_bc, r_eval, T_i, T_phase, dT=0.0,
               k_s=K_ICE, k_l=K_WATER, c_s=C_ICE, c_l=C_WATER,
               rho_s=RHO_ICE, rho_l=RHO_WATER, L_f=L_WATER,
               HW=0.5, dr=0.05, n_sub=4, k_ice_tdep=False,
               W_conv=0.0, neumann_after=None,
-              T_init=None, return_grid_final=False):
+              T_init=None, return_grid_final=False,
+              h_front=0.0, r_max=None):
     """
     1-D cylindrical FDM with apparent heat capacity for phase change.
 
@@ -146,6 +161,11 @@ def solve_fdm(t, T_bc, r_bc, r_eval, T_i, T_phase, dT=0.0,
     W_conv  : volumetric convection coeff (W/mm³/K), default 0 (pure conduction).
               Adds Pennes-like source q'''=W_conv*(T_i - T) in liquid/mushy nodes.
               Use h_to_W() to convert from surface h [W/m²/K].
+    h_front : convective coefficient at the ice front (W/mm²/K), default 0.
+              Adds the flux h_front*(T_i - T_phase) from the liquid at the
+              outermost frozen node. Use h_natural_convection().
+    r_max   : outer boundary radius (mm), e.g. the vessel wall. Default:
+              DOMAIN_MARGIN_MM beyond the outermost evaluation radius.
     neumann_after : float or None
               If set, switch inner BC from Dirichlet to zero-flux Neumann
               (dT/dr = 0) after this time (seconds).  Used to model passive
@@ -167,11 +187,9 @@ def solve_fdm(t, T_bc, r_bc, r_eval, T_i, T_phase, dT=0.0,
                          bounds_error=False,
                          fill_value=(T_eff[0], T_eff[-1]))
 
-    # Radial grid. The outer Dirichlet boundary sits DOMAIN_MARGIN_MM beyond
-    # the outermost evaluation radius; a domain-convergence test (revision
-    # notebook §1) showed the original 3 mm margin was not far enough for the
-    # longest freezes, so it is set from module-level constants.
-    r_max = max(float(np.max(r_eval)) + DOMAIN_MARGIN_MM, r_bc + DOMAIN_MIN_MM)
+    # Radial grid. Outer Dirichlet boundary at the vessel wall when given.
+    if r_max is None:
+        r_max = max(float(np.max(r_eval)) + DOMAIN_MARGIN_MM, r_bc + DOMAIN_MIN_MM)
     r = np.arange(r_bc, r_max + dr / 2, dr)
     Nr = len(r)
     n_int = Nr - 2  # interior nodes
@@ -256,8 +274,26 @@ def solve_fdm(t, T_bc, r_bc, r_eval, T_i, T_phase, dT=0.0,
                                  + rho_l * c_l * f_l[mushy]
                                  + rho_l * L_f / (2.0 * HW))
 
-            alpha = k_arr / rc_arr
-            beta = alpha * dt_sub / (dr * dr)
+            # Conductivity at the two faces of each interior node, so that the
+            # heat flux k*dT/dr is continuous across the ice front (Eq. 1).
+            k_bnd = []
+            for Tb in (T[0], T[-1]):
+                kb_ice = k_ice_T(Tb) if k_ice_tdep else k_s
+                fb = min(max((Tb - T_lo) / (2.0 * HW), 0.0), 1.0)
+                k_bnd.append(kb_ice + (k_l - kb_ice) * fb)
+            k_full = np.concatenate(([k_bnd[0]], k_arr, [k_bnd[1]]))
+            k_face = 0.5 * (k_full[:-1] + k_full[1:])
+            fo = dt_sub / (rc_arr * dr * dr)
+            a_w = fo * k_face[:-1] * (1.0 - gamma)
+            a_e = fo * k_face[1:] * (1.0 + gamma)
+
+            # Convective heat flux from the liquid, applied at the ice front
+            q_front = np.zeros(n_int)
+            if h_front > 0:
+                below = np.where(T[1:-1] < T_phase)[0]
+                if len(below) > 0 and T[0] < T_phase and below[-1] < n_int - 1:
+                    j = below[-1]
+                    q_front[j] = h_front * (T_i - T_phase) * dt_sub / (rc_arr[j] * dr)
 
             if use_neumann:
                 # --- Neumann dT/dr=0 at inner boundary ---
@@ -283,8 +319,7 @@ def solve_fdm(t, T_bc, r_bc, r_eval, T_i, T_phase, dT=0.0,
                     rc0 = (rho_s * c_s * (1.0 - fl0)
                            + rho_l * c_l * fl0
                            + rho_l * L_f / (2.0 * HW))
-                alpha0 = k0 / rc0
-                beta0 = alpha0 * dt_sub / (dr * dr)
+                beta0 = k_face[0] * (1.0 + gamma_0) * dt_sub / (rc0 * dr * dr)
 
                 # Extended system: n_int + 1 unknowns (nodes 0 .. Nr-2)
                 n_ext = n_int + 1
@@ -296,7 +331,7 @@ def solve_fdm(t, T_bc, r_bc, r_eval, T_i, T_phase, dT=0.0,
                 d_rhs_ext[0] = T[0]
 
                 # Rows 1..n_int: original interior nodes (shifted by 1)
-                b_main_ext[1:] = 1.0 + 2.0 * beta
+                b_main_ext[1:] = 1.0 + a_w + a_e
 
                 # Optional Pennes convection for interior
                 if W_conv > 0:
@@ -306,26 +341,26 @@ def solve_fdm(t, T_bc, r_bc, r_eval, T_i, T_phase, dT=0.0,
                         conv_factor[mushy] = W_conv * f_l[mushy] * dt_sub / rc_arr[mushy]
                     b_main_ext[1:] += conv_factor
 
-                d_rhs_ext[1:] = T[1:-1].copy()
+                d_rhs_ext[1:] = T[1:-1] + q_front
                 if W_conv > 0:
                     d_rhs_ext[1:] += conv_factor * T_i
 
                 # Sub-diagonal (n_ext - 1 entries): couples row i to row i-1
                 a_sub_ext = np.empty(n_ext - 1)
                 # Row 1 couples to row 0: node 1 left-neighbour is node 0
-                a_sub_ext[0] = -beta[0] * (1.0 - gamma[0])
+                a_sub_ext[0] = -a_w[0]
                 # Rows 2..n_int: same as original a_sub
-                a_sub_ext[1:] = -beta[1:] * (1.0 - gamma[1:])
+                a_sub_ext[1:] = -a_w[1:]
 
                 # Super-diagonal (n_ext - 1 entries): couples row i to row i+1
                 c_sup_ext = np.empty(n_ext - 1)
                 # Row 0 couples to row 1: ghost => coeff = -2*beta0
                 c_sup_ext[0] = -2.0 * beta0
                 # Rows 1..n_int-1: same as original c_sup
-                c_sup_ext[1:] = -beta[:-1] * (1.0 + gamma[:-1])
+                c_sup_ext[1:] = -a_e[:-1]
 
                 # Outer BC adjustment (Dirichlet at r_max, last row)
-                d_rhs_ext[-1] += beta[-1] * (1.0 + gamma[-1]) * T[-1]
+                d_rhs_ext[-1] += a_e[-1] * T[-1]
 
                 # Solve extended system
                 sol = _thomas(a_sub_ext, b_main_ext, c_sup_ext, d_rhs_ext)
@@ -335,10 +370,10 @@ def solve_fdm(t, T_bc, r_bc, r_eval, T_i, T_phase, dT=0.0,
             else:
                 # --- Dirichlet at inner boundary (standard) ---
                 # Tridiagonal coefficients
-                a_sub = -beta[1:] * (1.0 - gamma[1:])         # n_int-1
-                b_main = 1.0 + 2.0 * beta                      # n_int
-                c_sup = -beta[:-1] * (1.0 + gamma[:-1])        # n_int-1
-                d_rhs = T[1:-1].copy()
+                a_sub = -a_w[1:]                               # n_int-1
+                b_main = 1.0 + a_w + a_e                       # n_int
+                c_sup = -a_e[:-1]                              # n_int-1
+                d_rhs = T[1:-1] + q_front
 
                 # Optional Pennes-like convection in liquid/mushy nodes
                 if W_conv > 0:
@@ -350,8 +385,8 @@ def solve_fdm(t, T_bc, r_bc, r_eval, T_i, T_phase, dT=0.0,
                     d_rhs += conv_factor * T_i
 
                 # Boundary adjustments (Dirichlet both sides)
-                d_rhs[0] += beta[0] * (1.0 - gamma[0]) * T[0]
-                d_rhs[-1] += beta[-1] * (1.0 + gamma[-1]) * T[-1]
+                d_rhs[0] += a_w[0] * T[0]
+                d_rhs[-1] += a_e[-1] * T[-1]
 
                 # Solve
                 T[1:-1] = _thomas(a_sub, b_main, c_sup, d_rhs)
@@ -448,6 +483,8 @@ def build_experiments(base_dir):
                 fit_cols = [2],
                 val_cols = [3, 4],  # exclude outermost TC (2.8mm) — negligible cooling in 10s freeze
                 L_f      = L_WATER,
+                r_wall   = 17.4,    # 6-well plate well
+                dr       = 0.0125, n_sub = 64,
             ))
 
     # -- ICESPHERE 2x6 (6 expts) --
@@ -469,6 +506,8 @@ def build_experiments(base_dir):
                 fit_cols = [1],
                 val_cols = [2, 3, 4],
                 L_f      = L_WATER,
+                r_wall   = 43.5,    # 100 mm Petri dish
+                dr       = 0.025, n_sub = 16,
             ))
 
     # -- CLINICAL (9 expts) --
@@ -494,6 +533,8 @@ def build_experiments(base_dir):
                 fit_cols = [1],
                 val_cols = [2, 3, 4],
                 L_f      = L_WATER,
+                r_wall   = 43.5,    # 100 mm Petri dish
+                dr       = 0.025, n_sub = 16,
             ))
 
     # -- 3-D CRYSTAL (3 expts) --
@@ -514,6 +555,7 @@ def build_experiments(base_dir):
             fit_cols = [1],
             val_cols = [2, 3, 4, 5, 6],
             L_f      = L_GELMA,
+            dr       = 0.025, n_sub = 16,
             ch_offset= {5: 1.0},
         ))
 
@@ -623,7 +665,8 @@ def run_experiment(exp, dT_fixed=None, T_min_fixed=None, W_conv=0.0,
     # Solver kwargs (fixed literature properties + temperature-dependent k_ice)
     skw = dict(k_s=K_ICE, k_l=K_WATER, c_s=C_ICE, c_l=C_WATER,
                rho_s=RHO_ICE, rho_l=RHO_WATER, L_f=L_f, HW=0.5,
-               k_ice_tdep=True, W_conv=W_conv)
+               k_ice_tdep=True, W_conv=W_conv,
+               **model_kwargs(exp, T_i))
 
     # If neumann_thaw, pass t_nadir to solver so it switches BC mode
     if neumann_thaw:
@@ -868,7 +911,8 @@ def predict_temperature_field(exp, r_out=None, dr_out=0.05, r_max_out=15.0,
 
     skw = dict(k_s=K_ICE, k_l=K_WATER, c_s=C_ICE, c_l=C_WATER,
                rho_s=RHO_ICE, rho_l=RHO_WATER, L_f=L_f, HW=0.5,
-               k_ice_tdep=True, W_conv=W_conv)
+               k_ice_tdep=True, W_conv=W_conv,
+               **model_kwargs(exp, T_i))
     if neumann_thaw:
         skw['neumann_after'] = t_nadir
 
